@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+_h15*.xml
+_tsy*

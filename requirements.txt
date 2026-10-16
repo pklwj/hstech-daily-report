@@ -1,0 +1,2 @@
+# 仅使用标准库，无第三方依赖
+# 保留此文件以便后续扩展（如引入 requests / beautifulsoup4）

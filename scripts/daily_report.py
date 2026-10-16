@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 每日美债 + 恒生科技晨报
+
 数据源：
-  - 美联储 H.15 利率 RSS（10年期国债收益率）
-  - 美联储新闻稿 / 讲话 RSS（政策动向）
-  - 腾讯行情接口（恒生科技指数 HSTECH）
+  - 美国财政部 官方 CSV（Daily Treasury Par Yield Curve Rates）
+    10年期 / 2年期 / 30年期国债收益率，含跨年兜底
+  - 美联储官网 RSS（press_all.xml / speeches.xml），政策动向，按发布日期过滤
+  - 腾讯行情接口 qt.gtimg.cn（恒生科技指数 hkHSTECH）
+
 送达：
-  - QQ 邮箱 SMTP 发信
+  - QQ 邮箱 SMTP（smtp.qq.com:465, SSL）
+
 环境变量（由 GitHub Secrets 注入）：
   MAIL_USER       发件邮箱，如 pklwj@qq.com
   MAIL_AUTH_CODE  QQ邮箱 SMTP 授权码（16位），非登录密码
   MAIL_TO         收件邮箱，默认同 MAIL_USER
+  FED_NEWS_DAYS   美联储动向回溯天数，默认 7
 """
 
 import os
@@ -33,6 +38,9 @@ MAIL_USER = os.environ.get("MAIL_USER", "")
 MAIL_AUTH_CODE = os.environ.get("MAIL_AUTH_CODE", "")
 MAIL_TO = os.environ.get("MAIL_TO", "") or MAIL_USER
 
+# 美联储动向向前回溯的天数（美联储常连续多日无动态，窗口不宜过窄）
+FED_NEWS_DAYS = int(os.environ.get("FED_NEWS_DAYS", "7"))
+
 
 def fetch(url, headers=None, timeout=25):
     """带 UA 的 GET，返回文本；失败返回 None。"""
@@ -49,81 +57,83 @@ def fetch(url, headers=None, timeout=25):
         return None
 
 
-# ---------- 1. 美债：美联储 H.15 ----------
+# ---------- 1. 美债：美国财政部官方收益率曲线 ----------
 
-def get_treasury():
-    """从美国财政部官方 CSV 取最近两个交易日的国债收益率曲线。
-    数据源：home.treasury.gov Daily Treasury Par Yield Curve Rates
-    CSV 首行表头形如：Date,"1 Mo",...,"10 Yr",...
-    返回 {date, rate10y, prev_date, prev_rate10y, delta_bp, curve:{...}}
+def _fetch_treasury_year(y):
+    """取某一日历年的收益率曲线 CSV，返回 [(date_obj, {rate10y, rate2y, rate30y}), ...]。
+    CSV 按日期倒序排列（最新在前）。
     """
-    year = datetime.now(CST).year
-    urls = []
-    for y in (year, year - 1):
-        urls.append(
-            "https://home.treasury.gov/resource-center/data-chart-center/"
-            f"interest-rates/daily-treasury-rates.csv/{y}/all"
-            f"?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv"
-        )
-
-    txt = None
-    for u in urls:
-        txt = fetch(u)
-        if txt and "10 Yr" in txt:
-            break
-
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        f"interest-rates/daily-treasury-rates.csv/{y}/all"
+        f"?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv"
+    )
+    txt = fetch(url)
     if not txt or "10 Yr" not in txt:
-        return None
+        return []
 
     rows = [r for r in txt.splitlines() if r.strip()]
     if len(rows) < 2:
-        return None
+        return []
 
-    # 解析表头
     header = [c.strip().strip('"') for c in rows[0].split(",")]
     try:
-        idx_date = 0
         idx_10y = header.index("10 Yr")
         idx_2y = header.index("2 Yr") if "2 Yr" in header else None
         idx_30y = header.index("30 Yr") if "30 Yr" in header else None
     except ValueError as e:
-        print(f"[warn] treasury header parse: {e}", file=sys.stderr)
-        return None
+        print(f"[warn] treasury header parse {y}: {e}", file=sys.stderr)
+        return []
 
-    def parse_row(r):
+    out = []
+    for r in rows[1:]:
         c = [x.strip() for x in r.split(",")]
         if len(c) <= idx_10y:
-            return None
+            continue
         try:
-            d = c[idx_date]
+            # 日期格式 M/D/YYYY
+            d = datetime.strptime(c[0], "%m/%d/%Y").date()
             v10 = float(c[idx_10y])
         except ValueError:
-            return None
-        return {
-            "date": d,
+            continue
+        out.append((d, {
             "rate10y": v10,
             "rate2y": float(c[idx_2y]) if idx_2y is not None and c[idx_2y] else None,
             "rate30y": float(c[idx_30y]) if idx_30y is not None and c[idx_30y] else None,
-        }
+        }))
+    return out
 
-    # CSV 通常按日期倒序（最新在前）
-    parsed = [p for p in (parse_row(r) for r in rows[1:]) if p]
-    if not parsed:
+
+def get_treasury():
+    """取最近两个交易日的 10 年期国债收益率。
+
+    跨年兜底：把「当年 + 上一年」两个 CSV 合并后统一按日期排序，
+    避免每年 1 月初当年文件行数不足、算不出环比变化的问题。
+    """
+    year = datetime.now(CST).year
+    merged = []
+    for y in (year, year - 1):
+        merged.extend(_fetch_treasury_year(y))
+
+    if not merged:
         return None
 
-    cur = parsed[0]
-    prev = parsed[1] if len(parsed) > 1 else None
+    # 统一按日期倒序（最新在前）
+    merged.sort(key=lambda x: x[0], reverse=True)
+
+    cur_date, cur = merged[0]
+    prev_date, prev = (merged[1] if len(merged) > 1 else (None, None))
 
     delta_bp = None
     if prev:
         delta_bp = round((cur["rate10y"] - prev["rate10y"]) * 100, 1)
 
     return {
-        "date": cur["date"],
+        "date": cur_date.strftime("%Y-%m-%d"),
         "rate10y": cur["rate10y"],
         "rate2y": cur["rate2y"],
         "rate30y": cur["rate30y"],
-        "prev_date": prev["date"] if prev else "",
+        "prev_date": prev_date.strftime("%Y-%m-%d") if prev_date else "",
         "prev_rate10y": prev["rate10y"] if prev else None,
         "delta_bp": delta_bp,
     }
@@ -131,14 +141,45 @@ def get_treasury():
 
 # ---------- 2. 美联储动向 ----------
 
-def get_fed_news(limit=3):
-    """拉取美联储新闻稿 + 讲话，返回最近若干条标题。"""
+def _parse_pubdate(raw):
+    """解析 RSS pubDate。注意美联储 feed 的 pubDate 可能被 CDATA 包裹，
+    形如 <![CDATA[Tue, 13 Oct 2026 18:00:00 GMT]]>，需先剥离。
+    返回带时区的 datetime，失败返回 None。
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    # 剥离 CDATA
+    s = re.sub(r"^<!\[CDATA\[", "", s)
+    s = re.sub(r"\]\]>$", "", s)
+    s = s.strip()
+    # 常见格式：Tue, 13 Oct 2026 18:00:00 GMT
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def get_fed_news(total=6, days=None):
+    """拉取美联储新闻稿 + 讲话，只保留最近 days 天内的条目。
+
+    - days  : 回溯窗口（默认 FED_NEWS_DAYS）
+    - total : 最终返回的条目总数上限（两个源合并后统一截断，
+              避免某个源独占配额）
+    按发布时间倒序排列。
+    """
+    if days is None:
+        days = FED_NEWS_DAYS
+
     feeds = [
         ("新闻稿", "https://www.federalreserve.gov/feeds/press_all.xml"),
         ("讲话", "https://www.federalreserve.gov/feeds/speeches.xml"),
     ]
-    out = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    pool = []
+
     for label, url in feeds:
         txt = fetch(url)
         if not txt:
@@ -147,11 +188,10 @@ def get_fed_news(limit=3):
             root = ET.fromstring(txt)
         except ET.ParseError:
             continue
-        count = 0
         for it in root.iter():
             if it.tag.split("}")[-1] != "item":
                 continue
-            title = link = pub = ""
+            title = link = pubraw = ""
             for ch in it:
                 ct = ch.tag.split("}")[-1]
                 if ct == "title":
@@ -159,20 +199,32 @@ def get_fed_news(limit=3):
                 elif ct == "link":
                     link = (ch.text or "").strip()
                 elif ct == "pubDate":
-                    pub = (ch.text or "").strip()
+                    pubraw = (ch.text or "").strip()
             if not title:
                 continue
-            out.append({"kind": label, "title": title[:100], "link": link, "pub": pub})
-            count += 1
-            if count >= limit:
-                break
-    return out[:6]
+            pub = _parse_pubdate(pubraw)
+            # 无日期的条目跳过（无法判断时效，宁缺毋滥）
+            if pub is None or pub < cutoff:
+                continue
+            pool.append({
+                "kind": label,
+                "title": title[:100],
+                "link": link,
+                "dt": pub,
+                "date": pub.astimezone(CST).strftime("%m-%d"),
+            })
+
+    # 合并后按时间倒序，统一截断
+    pool.sort(key=lambda x: x["dt"], reverse=True)
+    return pool[:total]
 
 
 # ---------- 3. 恒生科技 ----------
 
 def get_hstech():
-    """腾讯行情接口取恒生科技指数最新点位与涨跌幅。"""
+    """腾讯行情接口取恒生科技指数最新点位与涨跌幅。
+    返回值额外包含 quote_date（行情所属日期）与 is_today（是否为当日数据）。
+    """
     txt = fetch("https://qt.gtimg.cn/q=hkHSTECH")
     if not txt:
         return None
@@ -183,6 +235,13 @@ def get_hstech():
     if len(parts) < 33:
         return None
     try:
+        qtime = parts[30] if len(parts) > 30 else ""
+        quote_date = ""
+        dm = re.search(r"(\d{4}/\d{2}/\d{2})", qtime)
+        if dm:
+            quote_date = dm.group(1).replace("/", "-")
+        today = datetime.now(CST).strftime("%Y-%m-%d")
+
         return {
             "name": "恒生科技指数",
             "price": float(parts[3]),
@@ -192,7 +251,9 @@ def get_hstech():
             "pct": float(parts[32]) if parts[32] else None,       # 涨跌幅 %
             "high": float(parts[33]) if len(parts) > 33 and parts[33] else None,
             "low": float(parts[34]) if len(parts) > 34 and parts[34] else None,
-            "time": parts[30] if len(parts) > 30 else "",
+            "time": qtime,
+            "quote_date": quote_date,
+            "is_today": bool(quote_date and quote_date == today),
         }
     except (ValueError, IndexError) as e:
         print(f"[warn] hstech parse: {e}", file=sys.stderr)
@@ -236,7 +297,7 @@ def build_report():
     hk = get_hstech()
 
     lines = []
-    lines.append(f"【美债 · 恒生科技晨报】{now.strftime('%Y-%m-%d %H:%M')} (北京时间)")
+    lines.append(f"【美债 · 恒生科技晨报】{now.strftime('%Y-%m-%d %H:%M')} 北京时间")
     lines.append("=" * 46)
     lines.append("")
 
@@ -267,12 +328,13 @@ def build_report():
     lines.append("")
 
     # 二、美联储动向
-    lines.append("二、美联储动向（近 3 日）")
+    lines.append(f"二、美联储动向（近 {FED_NEWS_DAYS} 日）")
     if fed:
         for f in fed:
-            lines.append(f"  · [{f['kind']}] {f['title']}")
+            stamp = f"[{f['date']}] " if f.get("date") else ""
+            lines.append(f"  · {stamp}[{f['kind']}] {f['title']}")
     else:
-        lines.append("  · 近 3 日无新公告/讲话")
+        lines.append(f"  · 近 {FED_NEWS_DAYS} 日无新公告/讲话")
     lines.append("")
 
     # 三、恒生科技
@@ -280,13 +342,16 @@ def build_report():
     if hk:
         arrow = "▲" if (hk.get("pct") or 0) >= 0 else "▼"
         pct = hk.get("pct")
-        lines.append(f"  · 最新点位：{hk['price']:.2f}")
+        # 标注数据所属日期：当日 / 上一交易日
+        if hk.get("is_today"):
+            tag = "当日收盘"
+        else:
+            tag = f"{hk.get('quote_date', '')} 收盘（上一交易日）"
+        lines.append(f"  · 最新点位：{hk['price']:.2f}　（{tag}）")
         if pct is not None:
             lines.append(f"  · 涨跌幅：{arrow} {pct:+.2f}%")
         if hk.get("high") and hk.get("low"):
             lines.append(f"  · 日内区间：{hk['low']:.2f} ~ {hk['high']:.2f}")
-        if hk.get("time"):
-            lines.append(f"  · 行情时间：{hk['time']}")
     else:
         lines.append("  · 暂未取到行情")
 

@@ -11,8 +11,9 @@
 
 由 GitHub Actions 定时触发（`.github/workflows/daily.yml`），**本机是否开机完全无关**。
 
-- 定时：`cron: "30 0 * * *"`（UTC 00:30 = 北京时间 08:30）
-- 注意：GitHub 的 cron 会有 5 分钟至 1 小时不等的延迟，属官方已知行为
+- 定时：`cron: "17 0 * * *"`（UTC 00:17 = 北京时间 08:17）
+- 注意：GitHub 的 `schedule` 是 best-effort，实测常延迟数小时甚至整天不派发；
+  需要准点请配外部定时器调用 `workflow_dispatch` API（见下）
 - 支持手动触发：仓库 → Actions → 每日美债恒科晨报 → Run workflow
 
 ## 数据源

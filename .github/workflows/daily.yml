@@ -2,10 +2,15 @@ name: 每日美债恒科晨报
 
 on:
   schedule:
-    # UTC 00:30 = 北京时间 08:30
-    # 注意：GitHub cron 可能延迟 5 分钟 ~ 1 小时
-    - cron: "30 0 * * *"
-  workflow_dispatch: {}   # 支持手动触发，方便测试
+    # UTC 00:17 = 北京时间 08:17（避开 :00/:30 高争抢分钟）
+    # GitHub 的 schedule 是 best-effort，延迟数小时甚至当天不跑都出现过
+    - cron: "17 0 * * *"
+  workflow_dispatch: {}   # 手动 / 外部定时器经 API 派发
+
+# 原生 cron 与外部定时器可能撞车，串行化，避免重复发信
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
 
 jobs:
   report:
@@ -13,6 +18,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: 触发来源
+        run: echo "triggered by ${{ github.event_name }} / ${{ github.event.schedule }}"
+
       - name: 检出代码
         uses: actions/checkout@v5
 
